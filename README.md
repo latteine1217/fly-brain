@@ -146,6 +146,68 @@ With the Poisson input held fixed, spike trains and membrane voltages are
 bit-identical across CPU/CSR, CPU/COO and MPS/COO, and unchanged from the
 `matmul(spikes, W.T)` formulation this replaced.
 
+### Neurotransmitter identity and synaptic kinetics
+
+The shipped connectivity parquet stores transmitter identity as a single
+`Excitatory` column of +1/-1, assigned per neuron by the majority rule in Shiu
+et al. That collapse loses two things. Monoamine neurons are neither GABAergic
+nor glutamatergic, so they score +1 and become indistinguishable from
+cholinergic neurons. And the Eckstein et al. (2024) classifier predicts six
+transmitters and cannot emit histamine at all, so histaminergic neurons --
+photoreceptors, whose output gates Ort/hclA chloride channels and is therefore
+inhibitory -- also score +1.
+
+`code/prepare_neurotransmitters.py` recovers the identity from the
+[FlyWire annotations](https://github.com/flyconnectome/flywire_annotations) and
+writes `data/neurotransmitters_783.csv`. Every neuron carries its provenance:
+
+```bash
+.venv/bin/python code/prepare_neurotransmitters.py
+```
+
+| provenance | neurons | share |
+| --- | --- | --- |
+| literature (`known_nt`) | 76,741 | 55.35% |
+| classifier (`top_nt`) | 61,754 | 44.54% |
+| none | 144 | 0.10% |
+
+`FLYBRAIN_NT_MODE` then selects the synapse model:
+
+| mode | behaviour |
+| --- | --- |
+| `paper` (default) | the published model, bit-identical to before |
+| `signs` | published model, transmitter signs corrected |
+| `channels` | one alpha conductance per distinct time constant |
+
+```bash
+FLYBRAIN_NT_MODE=signs .venv/bin/python main.py --pytorch --t_run 0.1 --n_run 1
+```
+
+Correcting the signs flips 12,233 neurons, 7,362 of them histaminergic. The
+weight-level effect is much smaller than the neuron-level one: those neurons sit
+upstream of 1.81% of all synapses, because photoreceptor arbours are only
+partly reconstructed in FAFB.
+
+**The time constants are mostly not constrained.** Only acetylcholine has a
+usable measurement (2 ms decay, Lee & O'Dowd 1999). GABA has separate fast
+GABA-A and slow GABA-B components whose balance depends on postsynaptic
+receptor expression, which the connectome does not carry; for glutamate no
+central-synapse decay constant was found, and the figures in circulation are
+oocyte desensitisation constants, a different quantity. Those entries stay at
+the published 5 ms and are marked `UNCONSTRAINED` in `NT_KINETICS`
+(`code/model_multi_nt.py`), with the reasoning recorded per entry. Nothing is
+filled in with a plausible-looking guess.
+
+One consequence to keep in mind when reading `channels` output: `w_syn` was
+fitted with a single 5 ms constant, and in this alpha synapse a pulse transfers
+charge proportional to tau. Shortening a transmitter's tau also weakens it, so
+firing rates move for reasons other than kinetics until `w_syn` is refitted.
+The runner prints this warning whenever more than one channel is active.
+
+A `channels` run is not comparable with the Brian2 ground truth and is labelled
+`PyTorch (MPS) [nt:channels]` in the results CSV so it cannot be mistaken for
+one.
+
 ### Ground truth comparison
 
 Brian2 (CPU) serves as the ground truth for neural accuracy: it implements the

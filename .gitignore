@@ -17,3 +17,8 @@ data/results/nature_2026_07/archive*
 # PyTorch cached weight matrices (generated from connectivity data)
 data/weight_coo.pkl
 data/weight_csr.pkl
+
+# Neurotransmitter data: downloaded upstream annotations and the
+# table derived from them by code/prepare_neurotransmitters.py
+data/flywire_annotations_783.tsv
+data/neurotransmitters_783.csv

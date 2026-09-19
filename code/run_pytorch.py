@@ -23,6 +23,7 @@ from pathlib import Path
 from time import perf_counter as time
 import traceback
 
+from model_multi_nt import MultiNTTorchModel, build_channels, load_nt_table
 from benchmark import (
     T_RUN_VALUES_SEC, N_RUN_VALUES,
     path_comp, path_con, path_wt,
@@ -83,6 +84,26 @@ def resolve_device():
     if torch.backends.mps.is_available():
         return 'mps'
     return 'cpu'
+
+
+NT_MODE_ENV_VAR = 'FLYBRAIN_NT_MODE'
+
+# paper    : the published model -- one time constant, the shipped +1/-1 signs
+# signs    : the published model with transmitter signs corrected from the
+#            FlyWire annotations (histamine and glycine are inhibitory; a
+#            classifier majority vote scored them excitatory)
+# channels : one synaptic conductance per distinct time constant
+VALID_NT_MODES = ('paper', 'signs', 'channels')
+
+
+def resolve_nt_mode():
+    """Select the synapse model. Defaults to reproducing the published one."""
+    mode = os.environ.get(NT_MODE_ENV_VAR, '').strip().lower() or 'paper'
+    if mode not in VALID_NT_MODES:
+        raise ValueError(
+            f'{NT_MODE_ENV_VAR} must be one of {VALID_NT_MODES}, got {mode!r}'
+        )
+    return mode
 
 
 def synchronize(device_name):
@@ -393,6 +414,60 @@ def get_weights(conn_path, comp_path, wt_dir, csr=True):
     else:
         return weight_coo
 
+def get_nt_weights(nt_mode, conn_path, comp_path, nt_path, device_name, logger):
+    """Build weights from the resolved per-neuron transmitter table.
+
+    'signs' collapses every transmitter onto the published time constant, so
+    the only change from the paper model is the polarity of neurons whose
+    transmitter gates a chloride channel. 'channels' additionally gives each
+    distinct time constant its own conductance.
+    """
+    nt_path = Path(nt_path)
+    if not nt_path.exists():
+        raise FileNotFoundError(
+            f'{nt_path} not found; generate it with '
+            'python code/prepare_neurotransmitters.py'
+        )
+
+    conn = pd.read_parquet(conn_path)
+    num_neurons = pd.read_csv(comp_path).shape[0]
+    nt = load_nt_table(nt_path, num_neurons)
+
+    # Neurons absent from the connectivity table never fire into anything, so
+    # their sign is irrelevant; default them to the paper's excitatory value.
+    shipped = (
+        conn.groupby('Presynaptic_Index')['Excitatory'].first()
+        .reindex(range(num_neurons)).fillna(1).to_numpy()
+    )
+
+    force_tau = MODEL_PARAMS['tauSyn'] if nt_mode == 'signs' else None
+    taus, matrices, report = build_channels(
+        conn, nt, num_neurons, shipped, force_tau=force_tau
+    )
+
+    logger.log(f"  Signs flipped:    {report['signs_overridden']} neurons")
+    if len(taus) > 1:
+        # w_syn was fitted with a single 5 ms time constant. In this alpha
+        # synapse an input pulse transfers charge proportional to tau, so
+        # giving a transmitter a shorter tau also weakens it. Firing rates from
+        # this mode are not comparable with the paper's without refitting w_syn.
+        logger.log(
+            "  NOTE: w_syn was calibrated at tau=5ms; changing tau also "
+            "changes charge transfer, so rates shift for reasons other than "
+            "kinetics. Refit w_syn before comparing."
+        )
+    for ch in report['channels']:
+        logger.log(
+            f"  channel tau={ch['tau']:>5.1f}ms  neurons={ch['neurons']:>6d}  "
+            f"synapses={ch['synapses']:>9d}  {', '.join(ch['classes'])}"
+        )
+
+    matrices = [m.to(device=device_name) for m in matrices]
+    if nt_mode == 'signs':
+        return taus, matrices[0], num_neurons
+    return taus, matrices, num_neurons
+
+
 # ============================================================================
 # Benchmark Functions
 # ============================================================================
@@ -406,6 +481,8 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
     Uses batch_size = n_run to run all trials in parallel on GPU.
     """
     device_name = resolve_device()
+    nt_mode = resolve_nt_mode()
+    nt_taus = None
     t_sim_ms = t_run_sec * 1000.0
     num_steps = int(t_sim_ms / DT)
 
@@ -417,6 +494,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
     logger.log(f"{run_info}BENCHMARK: t_run={t_run_sec}s, n_run={n_run}")
     logger.log_raw("=" * 80)
     logger.log(f"Device: {device_name.upper()}")
+    logger.log(f"Synapse model: {nt_mode}")
     logger.log(f"Steps: {num_steps} (dt={DT}ms)")
     logger.log(f"Experiment: {exp_name}")
     record_spikes = spike_io_enabled()
@@ -445,13 +523,20 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
         # ===== Phase 2: Load weights =====
         logger.log("Loading weights...")
         t_weights_start = time()
-        # MPS implements no sparse CSR ops at all, so it takes the COO matrix.
-        weights = get_weights(
-            str(path_con), str(path_comp), str(path_wt),
-            csr=(device_name != 'mps'),
-        )
-        weights = weights.to(device=device_name)
-        num_neurons = weights.shape[0]
+        if nt_mode == 'paper':
+            # MPS implements no sparse CSR ops at all, so it takes COO.
+            weights = get_weights(
+                str(path_con), str(path_comp), str(path_wt),
+                csr=(device_name != 'mps'),
+            )
+            weights = weights.to(device=device_name)
+            num_neurons = weights.shape[0]
+        else:
+            nt_taus, weights, num_neurons = get_nt_weights(
+                nt_mode, str(path_con), str(path_comp),
+                Path(path_wt) / 'neurotransmitters_783.csv',
+                device_name, logger,
+            )
         timings['weight_loading'] = time() - t_weights_start
         logger.log(f"  Weight loading:   {timings['weight_loading']:.3f}s")
         logger.log(f"  Neurons: {num_neurons}, Batch: {n_run}")
@@ -459,15 +544,28 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
         # ===== Phase 3: Create model =====
         logger.log("Creating model...")
         t_model_start = time()
-        model = TorchModel(
-            n_run,
-            num_neurons,
-            DT,
-            MODEL_PARAMS,
-            weights,
-            exc_indices=exc_indices,
-            device=device_name
-        )
+        if nt_mode == 'channels':
+            model = MultiNTTorchModel(
+                n_run,
+                num_neurons,
+                DT,
+                MODEL_PARAMS,
+                nt_taus,
+                weights,
+                LIFNeuron(n_run, num_neurons, DT, MODEL_PARAMS, device=device_name),
+                exc_indices=exc_indices,
+                device=device_name
+            )
+        else:
+            model = TorchModel(
+                n_run,
+                num_neurons,
+                DT,
+                MODEL_PARAMS,
+                weights,
+                exc_indices=exc_indices,
+                device=device_name
+            )
         conductance, delay_buffer, spikes, v, refrac = model.state_init()
         timings['model_creation'] = time() - t_model_start
         timings['model_setup_total'] = timings['weight_loading'] + timings['model_creation']
@@ -672,7 +770,13 @@ def run_all_benchmarks(t_run_values=None, n_run_values=None,
         experiment = get_experiment()
 
     device_name = resolve_device()
+    nt_mode = resolve_nt_mode()
+    # The synapse model is part of the result's identity: a 'channels' run is
+    # not comparable with the Brian2 ground truth and must not be labelled as
+    # though it were.
     backend_name = f'PyTorch ({device_name.upper()})'
+    if nt_mode != 'paper':
+        backend_name += f' [nt:{nt_mode}]'
 
     benchmarks = []
     for n_run in n_run_values:
