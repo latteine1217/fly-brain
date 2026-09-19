@@ -248,6 +248,15 @@ run as separate batch-1 processes than as one wide batch.
 Event propagation is implemented for the single-channel model. The per-channel
 models (`channels`, `channels-charge`) keep the sparse product and say so.
 
+`FLYBRAIN_COMPILE=1` additionally runs the model through `torch.compile`.
+Output stays bit-identical (83M spike entries, zero mismatches, on every
+configuration tested), so this too only trades a one-off compilation for a
+cheaper step: 1.98 to 1.43 ms on CPU with event propagation (t=6.3 over ten
+interleaved pairs), 3.80 to 3.39 ms on MPS, and 1% on the sparse product. The
+data-dependent gather length in `propagation.py` breaks the graph, but the
+dense state update still fuses around it. Compilation is warmed on a throwaway
+state before the timer starts, and costs 0.2-2.9 s once.
+
 Spike recording is buffered on the device and read back once per window rather
 than every step, which removes a per-step synchronisation worth 0.282 ms
 (sd 0.085, ten interleaved pairs). Timings on this machine drift by more than

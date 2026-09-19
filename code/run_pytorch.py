@@ -125,6 +125,20 @@ def resolve_propagation():
     return mode
 
 
+COMPILE_ENV_VAR = 'FLYBRAIN_COMPILE'
+
+
+def resolve_compile():
+    """Whether to put the model through torch.compile.
+
+    Output is bit-identical either way, so this only trades a one-off
+    compilation for a cheaper step.
+    """
+    return os.environ.get(COMPILE_ENV_VAR, '').strip().lower() in (
+        '1', 'true', 'yes', 'on'
+    )
+
+
 def resolve_nt_mode():
     """Select the synapse model. Defaults to reproducing the published one."""
     mode = os.environ.get(NT_MODE_ENV_VAR, '').strip().lower() or 'paper'
@@ -545,6 +559,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
     device_name = resolve_device()
     nt_mode = resolve_nt_mode()
     propagation = resolve_propagation()
+    compile_model = resolve_compile()
     nt_taus = None
     t_sim_ms = t_run_sec * 1000.0
     num_steps = int(t_sim_ms / DT)
@@ -559,6 +574,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
     logger.log(f"Device: {device_name.upper()}")
     logger.log(f"Synapse model: {nt_mode}")
     logger.log(f"Propagation: {propagation}")
+    logger.log(f"torch.compile: {'on' if compile_model else 'off'}")
     logger.log(f"Steps: {num_steps} (dt={DT}ms)")
     logger.log(f"Experiment: {exp_name}")
     record_spikes = spike_io_enabled()
@@ -649,6 +665,22 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
         # ===== Phase 4: Setup inputs =====
         rates = torch.zeros(n_run, num_neurons, device=device_name)
         rates[:, exc_indices] = stim_rate
+
+        if compile_model:
+            # Compilation happens on the first forward call. Warming it here on
+            # a throwaway state keeps it out of the simulation timer, which
+            # would otherwise report the compile as simulation cost.
+            t_compile = time()
+            model = torch.compile(model)
+            warm_state = model.state_init()
+            with torch.no_grad():
+                for _ in range(3):
+                    warm_state = model(rates, *warm_state)
+            synchronize(device_name)
+            timings['compile'] = time() - t_compile
+            timings['model_setup_total'] += timings['compile']
+            logger.log(f"  Compile:          {timings['compile']:.3f}s")
+            del warm_state
 
         # ===== Phase 5: Run simulation =====
         logger.log(f"Running simulation ({num_steps} steps, {n_run} trial(s) batched)...")
@@ -858,6 +890,10 @@ def run_all_benchmarks(t_run_values=None, n_run_values=None,
     backend_name = f'PyTorch ({device_name.upper()})'
     if nt_mode != 'paper':
         backend_name += f' [nt:{nt_mode}]'
+    if resolve_propagation() != 'sparse':
+        backend_name += ' [event]'
+    if resolve_compile():
+        backend_name += ' [compiled]'
 
     benchmarks = []
     for n_run in n_run_values:

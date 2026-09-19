@@ -200,20 +200,47 @@ State 檔：進度、數據、判讀。量測方法見 [measurement-protocol.md]
   - 生理對照：果蠅中樞神經元典型為個位數到數十 Hz，且多數時刻靜默。表中 11 Hz 一列已偏高估。
 - **副產物**（記入 measurement-protocol §6）：不反應期不限制發放率（只閘控突觸輸入，Poisson 繞過）；Poisson 驅動上限 10,000 Hz。
 
+## EXP-014：torch.compile
+
+- **狀態**：`done`（**假設部分支持**）｜ **日期**：2026-09-19
+- **假設**：`torch.compile` 融合密集狀態更新那串逐元素運算（該部分佔 CPU event 每步 1.81ms 中的 1.52ms）。
+- **預期變化**：CPU event 每步成本下降。
+- **證偽條件**：稀疏運算與 event 路徑的資料相依同步造成 graph break，融合無法發生 → 成本不變或變慢。
+
+**graph break 確實發生**：`propagation.py` 的 `int(counts.sum())` 被 dynamo 標記為斷點。但融合仍在斷點兩側成立，所以假設只被部分推翻。
+
+效能（配對交錯 10 對，200 步 × batch 1）：
+
+| 設定 | eager | compiled | 差 | se | t | 判定 |
+|---|---|---|---|---|---|---|
+| cpu/event | 1.98ms | **1.43ms** | +0.555 | 0.088 | **+6.3** | 快 28% |
+| mps/event | 3.80ms | 3.39ms | +0.388 | 0.189 | +2.1 | 快 11%（勉強解析） |
+| mps/sparse | 11.45ms | 11.31ms | +0.121 | 0.030 | +4.0 | 快 1% |
+
+**數值**：逐位元一致。三種設定各 8,318 萬個 spike 項目 **0 個不符**，最終膜電位差 0.000 mV（固定重播輸入，300 步 × batch 2）。
+
+**一次性編譯成本**：0.2–2.9s，視設定而定（實測 cpu/event 端到端為 2.93s）。已移出模擬計時器——用拋棄式狀態暖機，否則會被計入 `simulation_total`。
+
+**未採用**：`torch._dynamo.config.capture_scalar_outputs=True` 可消除該 graph break，但收益邊際（cpu 1.54→1.52ms、mps 2.97→2.63ms，皆未配對驗證），且它是全域設定、影響範圍超出本模型。
+
+- **判讀**：純收益——快 28%、數值不變，代價僅一次性編譯。
+- **落地**：`FLYBRAIN_COMPILE=1`。
+
 ---
 
 ## 目前最佳設定
 
 ```bash
-FLYBRAIN_PROPAGATION=event FLYBRAIN_TORCH_DEVICE=cpu .venv/bin/python main.py --pytorch --t_run 1 --n_run 1
+FLYBRAIN_PROPAGATION=event FLYBRAIN_TORCH_DEVICE=cpu FLYBRAIN_COMPILE=1 \
+  .venv/bin/python main.py --pytorch --t_run 1 --n_run 1
 ```
 
-每步 1.81ms。相對 clone 當下的狀態（CPU + sparse，84.73ms）快 47 倍。
+每步 1.43ms（不含 spike 紀錄）。相對 clone 當下的狀態（CPU + sparse，84.73ms）快 59 倍。
+端到端實測：1 秒大腦活動用 17.70s 模擬 + 7.19s 設定（含 2.93s 編譯）。
 **例外**：若研究對象是全腦高度活躍狀態（平均 > 100 Hz），在 MPS 上改用 `sparse`（EXP-013）。
 
 ## 未做
 
-- `torch.compile`：完全未測。
 - 事件驅動僅覆蓋單通道模型；`channels` / `channels-charge` 仍走 `sparse`。
 - CUDA 路徑全程未實測（無硬體）。
 - 近似方法：樹突距離衰減權重（純前處理、執行時零成本）、按神經髓區分室、接 Fly Cell Atlas 補受體表現圖。
