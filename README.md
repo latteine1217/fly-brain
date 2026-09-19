@@ -239,11 +239,39 @@ against 1.87 ms), because MPS spends most of an event step in kernel launch
 and one synchronisation regardless of how few spikes there are. Those cancel,
 and CPU comes out ahead until batch 32.
 
-**Batching stops paying.** With `sparse`, per-trial cost falls from 9.36 to
-3.50 ms between batch 1 and 32 on MPS. With `event` it is flat, 1.8-2.4 ms at
-every batch and every device, because event work scales with the batch and
-there is no fixed cost left to amortise. Multi-trial experiments are better
-run as separate batch-1 processes than as one wide batch.
+**Batching stops paying on CPU and MPS.** With `sparse`, per-trial cost falls
+from 9.36 to 3.50 ms between batch 1 and 32 on MPS. With `event` it is flat,
+1.8-2.4 ms at every batch on both, because event work scales with the batch and
+no fixed cost remains to amortise. Multi-trial runs are better as separate
+batch-1 processes there. CUDA behaves differently and is covered below.
+
+**On CUDA the window where `event` pays is narrow.** Measured on a GTX 1660
+SUPER, the sparse product costs a flat 1.48 ms per step whatever the activity,
+which is 7x cheaper than MPS and 55x cheaper than CPU. `event` beats it only in
+the very sparse regime the stimulus protocols produce:
+
+| | batch 1 | batch 8 | batch 32 |
+| --- | --- | --- | --- |
+| `sparse` | 1.49 ms | 11.81 ms | 19.22 ms |
+| `event` | 1.20 ms | 3.14 ms | 8.92 ms |
+| per trial (`event`) | 1.196 ms | 0.392 ms | **0.279 ms** |
+
+Drive every neuron instead and `event` loses at every level tested, from 0.86x
+at 160 spikes per step down to 0.16x at 27,721. Unlike CPU and MPS, batching
+does pay here: per-trial cost falls 4.3x between batch 1 and 32, making CUDA at
+batch 32 the cheapest per-trial configuration measured anywhere.
+
+The rule across devices is that the faster a device runs the sparse product,
+the narrower the activity range in which `event` is worth using: CPU wins
+everywhere tested, MPS below roughly 100 Hz mean firing, CUDA only in sparse
+protocols.
+
+`torch.compile` gains nothing on CUDA (1.425 against 1.428 ms), unlike the 28%
+it gives on CPU.
+
+Every CUDA configuration was checked against the CPU reference and is
+bit-identical: 83M spike entries, zero mismatches, zero difference in final
+membrane voltage, with and without `event` and with and without compilation.
 
 Event propagation is implemented for the single-channel model. The per-channel
 models (`channels`, `channels-charge`) keep the sparse product and say so.

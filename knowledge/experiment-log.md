@@ -161,7 +161,7 @@ State 檔：進度、數據、判讀。量測方法見 [measurement-protocol.md]
 | CPU | 32 | 213.49ms | 76.55ms | 2.8x | 2.392ms |
 
 - **結論一**：小批次時 **CPU 勝過 MPS**。拆帳：MPS 密集狀態更新 0.26ms / CPU 1.52ms（GPU 快 5.8 倍）；MPS 事件 gather 1.87ms / CPU 0.29ms（CPU 快 6.4 倍）。兩者抵銷。
-- **結論二**：**批次不再有好處**。`sparse` 時每 trial 由 9.36 降到 3.50ms；`event` 時在 1.8–2.4ms 持平。多 trial 實驗開多個 batch=1 行程即可。
+- **結論二**：**批次不再有好處（僅限 CPU 與 MPS）**。`sparse` 時每 trial 由 9.36 降到 3.50ms；`event` 時在 1.8–2.4ms 持平。多 trial 實驗在這兩個裝置上開多個 batch=1 行程即可。**CUDA 不適用**，見 EXP-015 §4。
 - **⚠ 修正紀錄**：事前推論 CPU 端到端約 12.3ms、GPU 領先 5 倍。實際 CPU 1.81ms，**高估 7 倍**。同樣來自跨次相減（CPU 整步 51ms − CPU 矩陣乘 39ms）。這是違反 §1 的第二次。
 
 ## EXP-012：跨裝置分工（MPS 密集更新 + CPU 事件 gather）
@@ -226,6 +226,65 @@ State 檔：進度、數據、判讀。量測方法見 [measurement-protocol.md]
 - **判讀**：純收益——快 28%、數值不變，代價僅一次性編譯。
 - **落地**：`FLYBRAIN_COMPILE=1`。
 
+## EXP-015：CUDA 路徑實測
+
+- **狀態**：`done` ｜ **日期**：2026-09-19
+- **硬體**：`home-gpu`（WSL2，GeForce GTX 1660 SUPER 6GB，driver 610.62，compute 7.5），torch 2.14.0+cu130
+- **動機**：EXP-002 的公式變更套用到所有裝置但 CUDA 從未實測，是 commit `9c9f862` 標註的唯一 userspace 風險。
+
+### 1. 公式回歸（風險解除）
+
+| 公式 | batch 1 | batch 8 | 與 CPU CSR 誤差 |
+|---|---|---|---|
+| `matmul(dense, CSR.T)`（遷移前） | 1.379ms | 35.261ms | 0 |
+| `sparse.mm(CSR, x.T).T`（已出貨） | 1.379ms | **9.618ms** | 0 |
+| `sparse.mm(COO, x.T).T` | 2.774ms | 7.554ms | 0 |
+
+**判讀**：未驗證就出貨的改動沒有破壞 CUDA——逐位元一致，batch 1 持平，batch 8 快 3.7 倍。
+
+### 2. 端到端等價
+
+四種設定（sparse / event × 有無 compile）對 CPU 參考皆 **0 個不符 / 8,318 萬項目、0.000 mV**。
+
+### 3. 效能（batch 1，配對交錯 8 對）
+
+| 設定 | 每步 | 相對 sparse |
+|---|---|---|
+| sparse | 1.428ms | 1.00x |
+| **event** | **1.094ms** | 1.31x |
+| sparse+compile | 1.425ms | 1.00x |
+| event+compile | 1.148ms | 1.24x |
+
+`torch.compile` 在 CUDA 上**無收益**（對比 CPU 的 28%）。
+
+### 4. 批次擴展
+
+| batch | sparse | event | 加速 | event 每 trial |
+|---|---|---|---|---|
+| 1 | 1.49ms | 1.20ms | 1.25x | 1.196ms |
+| 8 | 11.81ms | 3.14ms | 3.76x | 0.392ms |
+| 32 | 19.22ms | 8.92ms | 2.15x | **0.279ms** |
+
+**⚠ 修正紀錄**：EXP-011 的結論「批次不再有好處」只在 CPU 與 MPS 成立。**CUDA 上批次有用**——每 trial 降 4.3 倍。原結論寫得過於一般化，缺 CUDA 這個資料點；已在 README 與該筆加上裝置限定。
+
+### 5. 活動量掃描（全神經元驅動，batch 1）
+
+| 全腦平均 Hz | 每步發放 | sparse | event | 加速 |
+|---|---|---|---|---|
+| 11.5 | 160 | 1.49ms | 1.73ms | **0.86x** |
+| 107.2 | 1,486 | 1.48ms | 2.08ms | 0.71x |
+| 1,003 | 13,910 | 1.48ms | 5.45ms | 0.27x |
+| 2,000 | 27,721 | 1.48ms | 9.36ms | 0.16x |
+
+**判讀**：CUDA 上 event 在每一個活動量都輸，連最低的 160 發放/步亦然；只在糖 GRN 那類極稀疏協議（每步約 1.7 發放）才贏。
+
+### 跨裝置規律
+
+CUDA 的 sparse 是 1.48ms 平坦，比 MPS 快 7 倍、比 CPU 快 55 倍。
+**裝置的 sparse 越快，event 的有效窗口越窄**：CPU 全範圍皆贏，MPS 在約 100 Hz 以下，CUDA 僅限稀疏協議。
+
+- **環境**：`~/fly-brain` on home-gpu，`.venv`（uv，Python 3.12）。
+
 ---
 
 ## 目前最佳設定
@@ -237,10 +296,13 @@ FLYBRAIN_PROPAGATION=event FLYBRAIN_TORCH_DEVICE=cpu FLYBRAIN_COMPILE=1 \
 
 每步 1.43ms（不含 spike 紀錄）。相對 clone 當下的狀態（CPU + sparse，84.73ms）快 59 倍。
 端到端實測：1 秒大腦活動用 17.70s 模擬 + 7.19s 設定（含 2.93s 編譯）。
-**例外**：若研究對象是全腦高度活躍狀態（平均 > 100 Hz），在 MPS 上改用 `sparse`（EXP-013）。
+**例外**：
+- 全腦高度活躍（平均 > 100 Hz）時，MPS 上改用 `sparse`（EXP-013）。
+- **CUDA 上除極稀疏協議外一律用 `sparse`**，且批次有用（EXP-015）。
+
+多 trial 吞吐量最佳：`home-gpu` 的 GTX 1660 SUPER + `event` + batch 32 = **每 trial 0.279ms**。
 
 ## 未做
 
 - 事件驅動僅覆蓋單通道模型；`channels` / `channels-charge` 仍走 `sparse`。
-- CUDA 路徑全程未實測（無硬體）。
 - 近似方法：樹突距離衰減權重（純前處理、執行時零成本）、按神經髓區分室、接 Fly Cell Atlas 補受體表現圖。
