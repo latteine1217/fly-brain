@@ -208,6 +208,81 @@ A `channels` run is not comparable with the Brian2 ground truth and is labelled
 `PyTorch (MPS) [nt:channels]` in the results CSV so it cannot be mistaken for
 one.
 
+### Calibrating w_syn
+
+`w_syn` is the model's only free parameter; every other constant is cited to a
+measurement. Anything that changes synaptic gain invalidates it, so
+`code/calibrate_w_syn.py` refits it against the sugar-GRN/MN9 protocol.
+
+```bash
+.venv/bin/python code/calibrate_w_syn.py --nt-mode paper --dose-response
+.venv/bin/python code/calibrate_w_syn.py --nt-mode paper --noise 5
+.venv/bin/python code/calibrate_w_syn.py --nt-mode signs
+```
+
+**The published criterion does not reproduce here.** Shiu et al. chose `w_syn`
+so that 100 Hz sugar-GRN drive puts MN9 at roughly 80% of maximal firing,
+without defining maximal, and neither reading of it survives contact with the
+v783 data.
+
+Read as a plateau in the dose-response curve, there is no plateau — MN9 is
+still rising at 600 Hz, and its 100 Hz rate is 52% of the 600 Hz rate and 62%
+of the rate at 200 Hz, the top of the paper's own sweep:
+
+| sugar GRN drive | 25 Hz | 50 | 75 | 100 | 200 | 400 | 600 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| MN9 | 0.0 | 17.9 | 57.9 | 63.3 | 101.7 | 117.9 | 121.2 |
+
+Read as a ceiling over `w_syn`, the quantity does not exist. MN9's rate is not
+monotonic in `w_syn`, because raising it amplifies the 30% of neurons that are
+inhibitory just as much: `w_syn=5.0` gives a *lower* MN9 rate than the
+published 0.275, and `w_syn=3.125` silences MN9 outright. The paper also
+calibrated against FlyWire v630 while this repository ships v783, and the two
+sugar GRN sets differ by one root id.
+
+The script therefore fits `w_syn` so that each synapse model reaches the same
+MN9 rate as the published model does at its published `w_syn`. That is an
+operational substitute, not the paper's criterion, and it is labelled as such.
+
+**Read any fit against the noise floor first.** The Poisson input is unseeded,
+so repeating one configuration scatters: 69.9 Hz mean, 1.4 Hz sd over five
+repeats, and 64.8-71.7 Hz across separate invocations. The script averages the
+reference over `--reference-repeats` and says so explicitly when a fitted shift
+is no larger than that scatter.
+
+On that basis, `signs` needs no measurable change: the correction moves only
+1.81% of synaptic weight and the fitted shift sits inside the noise. Keep the
+published 0.275.
+
+**Raw `channels` cannot be calibrated by `w_syn` at all.** Between 0.44 and
+4.61 the MN9 rate runs 0.0, 11.7, 14.6, 4.0, 6.2, 64.2 Hz, and the script
+refuses to bisect through that rather than report a fit from it. The cause is
+mechanistic, not numerical: shortening only the cholinergic time constant
+leaves inhibition transferring 2.5x the charge per spike, so the
+excitation/inhibition balance is broken and no single scalar restores it.
+
+`channels-charge` exists for that reason. It scales each channel by
+`tau_ref/tau`, holding the charge per presynaptic spike fixed so that only the
+time course of the conductance differs. It is the mode to use when comparing
+kinetics against the published model; raw `channels` reflects the parameter
+table as written and is left available deliberately.
+
+Holding charge fixed does not by itself restore the operating point, because
+threshold crossing follows the peak conductance and not the integral: at the
+published `w_syn`, `channels-charge` drives MN9 to 129.8 Hz against the paper
+model's 69.0 Hz. It does restore monotonicity, so the fit converges.
+
+| mode | w_syn | MN9 at the published w_syn |
+| --- | --- | --- |
+| `paper` | 0.275 | 69.0 Hz (reference, mean of 3) |
+| `signs` | 0.275 — unchanged | within the reference scatter |
+| `channels` | not fittable | — |
+| `channels-charge` | **0.1977** (ratio 0.719) | 129.8 Hz |
+
+The `signs` row is a measurement, not an omission: two independent fits landed
+at 0.2653 and 0.2802, straddling the published 0.275, which is what noise looks
+like rather than a shift.
+
 ### Ground truth comparison
 
 Brian2 (CPU) serves as the ground truth for neural accuracy: it implements the

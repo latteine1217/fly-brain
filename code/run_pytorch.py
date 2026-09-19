@@ -93,7 +93,13 @@ NT_MODE_ENV_VAR = 'FLYBRAIN_NT_MODE'
 #            FlyWire annotations (histamine and glycine are inhibitory; a
 #            classifier majority vote scored them excitatory)
 # channels : one synaptic conductance per distinct time constant
-VALID_NT_MODES = ('paper', 'signs', 'channels')
+# channels-charge
+#          : as channels, with each channel rescaled to hold the charge per
+#            presynaptic spike fixed. Raw 'channels' cannot be returned to the
+#            paper's operating point by w_syn alone -- MN9's rate is not
+#            monotonic in w_syn there, because shortening only the cholinergic
+#            time constant shifts the excitation/inhibition balance.
+VALID_NT_MODES = ('paper', 'signs', 'channels', 'channels-charge')
 
 
 def resolve_nt_mode():
@@ -441,25 +447,36 @@ def get_nt_weights(nt_mode, conn_path, comp_path, nt_path, device_name, logger):
     )
 
     force_tau = MODEL_PARAMS['tauSyn'] if nt_mode == 'signs' else None
+    charge_ref = MODEL_PARAMS['tauSyn'] if nt_mode == 'channels-charge' else None
     taus, matrices, report = build_channels(
-        conn, nt, num_neurons, shipped, force_tau=force_tau
+        conn, nt, num_neurons, shipped,
+        force_tau=force_tau, charge_ref_tau=charge_ref,
     )
 
     logger.log(f"  Signs flipped:    {report['signs_overridden']} neurons")
-    if len(taus) > 1:
-        # w_syn was fitted with a single 5 ms time constant. In this alpha
-        # synapse an input pulse transfers charge proportional to tau, so
-        # giving a transmitter a shorter tau also weakens it. Firing rates from
-        # this mode are not comparable with the paper's without refitting w_syn.
+    if len(taus) > 1 and charge_ref is None:
+        # Charge per spike scales with tau here, so a shorter tau is also a
+        # weaker synapse. That breaks the excitation/inhibition balance rather
+        # than merely rescaling it, and no single w_syn restores the operating
+        # point: MN9's rate is not monotonic in w_syn under this mode.
         logger.log(
-            "  NOTE: w_syn was calibrated at tau=5ms; changing tau also "
-            "changes charge transfer, so rates shift for reasons other than "
-            "kinetics. Refit w_syn before comparing."
+            "  NOTE: charge per spike scales with tau, so shortening one "
+            "transmitter's tau also weakens it. This mode cannot be returned "
+            "to the paper's operating point by w_syn alone; use "
+            "channels-charge for comparisons."
+        )
+    elif len(taus) > 1:
+        # Charge is held fixed, but the peak conductance is not, and threshold
+        # crossing depends on the peak.
+        logger.log(
+            "  NOTE: charge per spike is held fixed, but peak conductance is "
+            "not, so w_syn still needs refitting; see code/calibrate_w_syn.py."
         )
     for ch in report['channels']:
         logger.log(
-            f"  channel tau={ch['tau']:>5.1f}ms  neurons={ch['neurons']:>6d}  "
-            f"synapses={ch['synapses']:>9d}  {', '.join(ch['classes'])}"
+            f"  channel tau={ch['tau']:>5.1f}ms  gain={ch['gain']:>5.2f}  "
+            f"neurons={ch['neurons']:>6d}  synapses={ch['synapses']:>9d}  "
+            f"{', '.join(ch['classes'])}"
         )
 
     matrices = [m.to(device=device_name) for m in matrices]
@@ -544,7 +561,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
         # ===== Phase 3: Create model =====
         logger.log("Creating model...")
         t_model_start = time()
-        if nt_mode == 'channels':
+        if nt_mode.startswith('channels'):
             model = MultiNTTorchModel(
                 n_run,
                 num_neurons,

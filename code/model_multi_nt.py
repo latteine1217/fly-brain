@@ -127,7 +127,8 @@ def resolve_signs(nt, shipped_sign):
     return sign, int((sign != shipped).sum())
 
 
-def build_channels(conn, nt, num_neurons, shipped_sign, force_tau=None):
+def build_channels(conn, nt, num_neurons, shipped_sign, force_tau=None,
+                   charge_ref_tau=None):
     """Group transmitters by time constant and build one sparse matrix each.
 
     Returns (taus, matrices, report) where matrices[k] is a sparse COO matrix
@@ -161,16 +162,24 @@ def build_channels(conn, nt, num_neurons, shipped_sign, force_tau=None):
     matrices, report = [], []
     for k, tau in enumerate(taus):
         m = syn_channel == k
+        # In this alpha synapse the conductance decays as exp(-t/tau) from the
+        # input amplitude, so one presynaptic spike transfers charge
+        # proportional to tau. Left alone, giving acetylcholine a shorter tau
+        # weakens excitation relative to inhibition and moves the network off
+        # its operating point for reasons that have nothing to do with
+        # kinetics. Scaling by charge_ref_tau/tau holds the charge per spike
+        # fixed so that only the time course differs.
+        gain = 1.0 if charge_ref_tau is None else charge_ref_tau / tau
         idx = torch.from_numpy(np.stack([post[m], pre[m]]))
         matrices.append(
             torch.sparse_coo_tensor(
-                idx, torch.from_numpy(val[m]).to(torch.float32),
+                idx, torch.from_numpy(val[m] * gain).to(torch.float32),
                 (num_neurons, num_neurons),
             ).coalesce()
         )
         classes = sorted(c for c, ch in channel_of_class.items() if ch == k)
         report.append({
-            'tau': tau, 'classes': classes,
+            'tau': tau, 'gain': gain, 'classes': classes,
             'neurons': int((channel_of_neuron == k).sum()),
             'synapses': int(m.sum()),
         })
