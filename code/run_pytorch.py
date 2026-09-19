@@ -2,8 +2,8 @@
 PyTorch benchmark runner for the Drosophila brain model.
 
 Implements the LIF neuron model with alpha-function synapses using PyTorch,
-with support for both CPU and CUDA GPU computation. Batches n_run trials
-in parallel for efficient GPU utilization.
+with support for CPU, CUDA and Apple Metal (MPS) computation. Batches n_run
+trials in parallel for efficient GPU utilization.
 
 Model architecture (from Shiu et al.):
     PoissonSpikeGenerator → recurrent weights (sparse matmul) → AlphaLIF
@@ -12,6 +12,7 @@ Model architecture (from Shiu et al.):
 Called by benchmark.py orchestrator.
 """
 
+import os
 import pandas as pd
 import pyarrow  # noqa: F401  — must be imported before torch to avoid libarrow conflict
 import pickle
@@ -47,6 +48,64 @@ MODEL_PARAMS = {
 }
 
 DT = 0.1  # Simulation timestep in ms (matches Brian2 defaultclock.dt)
+
+# ============================================================================
+# Device Selection
+# ============================================================================
+
+# Set to cpu/cuda/mps to pin the backend. The MPS-vs-CPU parity check relies on
+# this: the two runs must differ in the device and in nothing else.
+DEVICE_ENV_VAR = 'FLYBRAIN_TORCH_DEVICE'
+
+VALID_DEVICES = ('cpu', 'cuda', 'mps')
+
+
+def resolve_device():
+    """Select the compute device, honouring an explicit override.
+
+    Fails loudly when an override names an unavailable backend: silently
+    demoting to CPU would turn a device benchmark into a mislabelled CPU run.
+    """
+    override = os.environ.get(DEVICE_ENV_VAR, '').strip().lower()
+    if override:
+        if override not in VALID_DEVICES:
+            raise ValueError(
+                f'{DEVICE_ENV_VAR} must be one of {VALID_DEVICES}, got {override!r}'
+            )
+        if override == 'cuda' and not torch.cuda.is_available():
+            raise RuntimeError(f'{DEVICE_ENV_VAR}=cuda but CUDA is unavailable')
+        if override == 'mps' and not torch.backends.mps.is_available():
+            raise RuntimeError(f'{DEVICE_ENV_VAR}=mps but MPS is unavailable')
+        return override
+
+    if torch.cuda.is_available():
+        return 'cuda'
+    if torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
+
+
+def synchronize(device_name):
+    """Block until queued device work completes.
+
+    CUDA and MPS both dispatch asynchronously, so without this the simulation
+    timer stops while work is still in flight and reports a fictional duration.
+    """
+    if device_name == 'cuda':
+        torch.cuda.synchronize()
+    elif device_name == 'mps':
+        torch.mps.synchronize()
+
+
+def memory_used_gb(device_name):
+    """Device memory in use, or None where the backend cannot report it."""
+    if device_name == 'cuda':
+        free, total = torch.cuda.mem_get_info(device_name)
+        return (total - free) / 1024 ** 3
+    if device_name == 'mps':
+        return torch.mps.current_allocated_memory() / 1024 ** 3
+    return None
+
 
 # ============================================================================
 # Model Classes
@@ -252,10 +311,14 @@ class TorchModel(nn.Module):
 
         voltage_stim = self.scale * poisson_spikes
 
-        weighted_spikes = torch.matmul(
-            spikes,
-            self.weights.transpose(0, 1)
-        )
+        # weights is [post, pre], so the recurrent drive is W @ spikes^T,
+        # transposed back to [batch, post]. Written as sparse.mm rather than
+        # matmul(dense, sparse.T) because the latter leaves the optimised
+        # sparse kernel: 44x slower on MPS, ~1.5x on CPU at batch 8.
+        weighted_spikes = torch.sparse.mm(
+            self.weights,
+            spikes.t().contiguous()
+        ).t()
 
         recurrent_input = self.scale * weighted_spikes
 
@@ -311,6 +374,12 @@ def get_weights(conn_path, comp_path, wt_dir, csr=True):
         with open(coo_path, 'wb') as f:
             pickle.dump(weight_coo, f)
 
+    # torch.sparse.mm re-sorts an uncoalesced COO on every call, costing 44x
+    # per timestep on MPS. Coalescing once moves that into setup. The
+    # connectome holds no duplicate (post, pre) pairs, so nnz is unchanged and
+    # the resulting matrix is bit-identical.
+    weight_coo = weight_coo.coalesce()
+
     if csr:
         try:
             with open(csr_path, 'rb') as f:
@@ -336,7 +405,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
 
     Uses batch_size = n_run to run all trials in parallel on GPU.
     """
-    device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device_name = resolve_device()
     t_sim_ms = t_run_sec * 1000.0
     num_steps = int(t_sim_ms / DT)
 
@@ -376,7 +445,11 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
         # ===== Phase 2: Load weights =====
         logger.log("Loading weights...")
         t_weights_start = time()
-        weights = get_weights(str(path_con), str(path_comp), str(path_wt), csr=True)
+        # MPS implements no sparse CSR ops at all, so it takes the COO matrix.
+        weights = get_weights(
+            str(path_con), str(path_comp), str(path_wt),
+            csr=(device_name != 'mps'),
+        )
         weights = weights.to(device=device_name)
         num_neurons = weights.shape[0]
         timings['weight_loading'] = time() - t_weights_start
@@ -401,10 +474,9 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
         logger.log(f"  Model creation:   {timings['model_creation']:.3f}s")
         logger.log(f"  Total setup:      {timings['model_setup_total']:.3f}s")
 
-        if device_name == 'cuda':
-            free, total = torch.cuda.mem_get_info(device_name)
-            vram_gb = (total - free) / 1024 ** 3
-            logger.log(f"  VRAM after setup: {vram_gb:.2f} GB")
+        mem_gb = memory_used_gb(device_name)
+        if mem_gb is not None:
+            logger.log(f"  Device mem after setup: {mem_gb:.2f} GB")
 
         # ===== Phase 4: Setup inputs =====
         rates = torch.zeros(n_run, num_neurons, device=device_name)
@@ -441,8 +513,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
                         f" - {elapsed:.1f}s elapsed"
                     )
 
-        if device_name == 'cuda':
-            torch.cuda.synchronize()
+        synchronize(device_name)
 
         timings['simulation_total'] = time() - t_simulation_start
         timings['simulation_avg_per_trial'] = timings['simulation_total'] / n_run
@@ -450,10 +521,9 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
         logger.log(f"  Simulation time:  {timings['simulation_total']:.3f}s")
         logger.log(f"  Avg per trial:    {timings['simulation_avg_per_trial']:.3f}s")
 
-        if device_name == 'cuda':
-            free, total = torch.cuda.mem_get_info(device_name)
-            vram_gb = (total - free) / 1024 ** 3
-            logger.log(f"  VRAM used:        {vram_gb:.2f} GB")
+        mem_gb = memory_used_gb(device_name)
+        if mem_gb is not None:
+            logger.log(f"  Device mem used:  {mem_gb:.2f} GB")
 
         # ===== Phase 6: Collect and save results =====
         logger.log("Collecting results...")
@@ -601,7 +671,7 @@ def run_all_benchmarks(t_run_values=None, n_run_values=None,
     if experiment is None:
         experiment = get_experiment()
 
-    device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device_name = resolve_device()
     backend_name = f'PyTorch ({device_name.upper()})'
 
     benchmarks = []
@@ -618,6 +688,8 @@ def run_all_benchmarks(t_run_values=None, n_run_values=None,
     logger.log(f"Device: {device_name.upper()}")
     if device_name == 'cuda':
         logger.log(f"GPU: {torch.cuda.get_device_name(0)}")
+    elif device_name == 'mps':
+        logger.log("GPU: Apple Metal (MPS)")
     logger.log(f"t_run values: {t_run_values} seconds")
     logger.log(f"n_run values: {n_run_values}")
     if run_label:

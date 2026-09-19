@@ -109,6 +109,43 @@ cd data/results/nature_2026_07
 sha256sum -c checksums.sha256
 ```
 
+### Apple Silicon (MPS)
+
+The PyTorch backend runs on Apple's Metal backend. Device selection is automatic
+(`cuda` > `mps` > `cpu`) and can be pinned with `FLYBRAIN_TORCH_DEVICE`, which
+fails loudly rather than demoting to CPU if the named backend is unavailable.
+
+```bash
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements-mps.txt
+
+.venv/bin/python main.py --pytorch --t_run 0.1 --n_run 1
+
+# pin a device, e.g. to compare MPS against CPU
+FLYBRAIN_TORCH_DEVICE=cpu .venv/bin/python main.py --pytorch --t_run 0.1 --n_run 1
+```
+
+`environment.yml` does not resolve on macOS -- it pins brian2cuda, GeNN and the
+CUDA wheel index -- so use `requirements-mps.txt`. Without an NVIDIA GPU only
+`--brian2-cpu` and `--pytorch` are available.
+
+MPS implements no sparse CSR operations, so the weight matrix is held in COO on
+that device. Two further details are what make the sparse kernel actually
+engage: the recurrent step is written as `torch.sparse.mm(W, spikes.T).T`
+rather than `matmul(spikes, W.T)`, and the COO matrix is coalesced once at load
+time. Skipping either drops onto a fallback path costing roughly 190 ms per
+timestep. Measured on an M3 (138,639 neurons, 15.1M synapses, `t_run=0.1`,
+`n_run=1`):
+
+| path | simulation time |
+| --- | --- |
+| CPU | 51.3 s |
+| MPS | 5.7 s |
+
+With the Poisson input held fixed, spike trains and membrane voltages are
+bit-identical across CPU/CSR, CPU/COO and MPS/COO, and unchanged from the
+`matmul(spikes, W.T)` formulation this replaced.
+
 ### Ground truth comparison
 
 Brian2 (CPU) serves as the ground truth for neural accuracy: it implements the

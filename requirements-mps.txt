@@ -1,0 +1,14 @@
+# Dependency set for the PyTorch backend on macOS / Apple Silicon.
+#
+# environment.yml does not resolve on Darwin: it pins brian2cuda, the GeNN
+# source archive and the CUDA 12.6 wheel index, none of which build here.
+# The packages below are everything `python main.py --pytorch` imports.
+#
+#   uv venv --python 3.12 .venv
+#   uv pip install --python .venv/bin/python -r requirements-mps.txt
+#
+# Verified with torch 2.14.0 on macOS 27 / Apple M3.
+torch
+numpy
+pandas
+pyarrow
