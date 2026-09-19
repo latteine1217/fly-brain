@@ -21,7 +21,11 @@ This triggers Poisson spiking in the target neurons.
 Two sets of neurons with distinct frequencies can be defined.
 - *Silencing*:
 In addition to activation, a different set of neurons can be silenced to model optogenetic silencing.
-This sets all synaptic connections to and from those neurons to zero.
+This sets that neuron's *outgoing* synaptic weights to zero: it keeps its own
+inputs and can still reach threshold, but its spikes reach nothing. (An earlier
+version of this sentence said connections in both directions were cut. The
+reference implementation silences with `syn.w['<n> == i'] = 0`, and Brian2's `i`
+is the presynaptic index, so only the outgoing side is affected.)
 
 The entrypoint is [main.py](main.py), which parses CLI arguments and calls
 [code/benchmark.py](code/benchmark.py) -- the central orchestrator that dispatches
@@ -145,6 +149,24 @@ timestep. Measured on an M3 (138,639 neurons, 15.1M synapses, `t_run=0.1`,
 With the Poisson input held fixed, spike trains and membrane voltages are
 bit-identical across CPU/CSR, CPU/COO and MPS/COO, and unchanged from the
 `matmul(spikes, W.T)` formulation this replaced.
+
+### Lesions and controls
+
+Silencing is how a control is run against this model, and until now the PyTorch
+backend ignored the `neu_slnc` field in an experiment definition entirely: a
+lesion study configured there would have produced intact results with no error
+and no warning. The backend now honours it, and `FLYBRAIN_SILENCE` adds ids on
+top so a control does not require editing `benchmark.py`:
+
+```bash
+FLYBRAIN_SILENCE=720575940624963786,720575940630233916 \
+  .venv/bin/python main.py --pytorch --t_run 0.1 --n_run 1
+```
+
+Ids not present in the connectome raise rather than being skipped. Silencing all
+21 sugar GRNs removes 1,550 outgoing synapses and takes the response from 348
+active neurons to 21 — the GRNs keep firing on their Poisson drive, and nothing
+downstream of them does.
 
 ### Neurotransmitter identity and synaptic kinetics
 

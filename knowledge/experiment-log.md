@@ -320,6 +320,33 @@ CUDA 的 sparse 是 1.48ms 平坦，比 MPS 快 7 倍、比 CPU 快 55 倍。
 
 - **環境**：`~/fly-brain` on home-gpu，`.venv`（uv，Python 3.12）。
 
+## EXP-016：PyTorch 後端的靜默（病灶）支援
+
+- **狀態**：`done` ｜ **日期**：2026-09-20
+- **動機**：任何學習或功能宣稱都需要對照組，而病灶是這個模型的主要對照工具。
+
+**發現的缺陷**：`neu_slnc` 欄位存在於實驗設定，Brian2 後端有 `silence_neurons` 實作，
+但 **PyTorch 後端完全忽略它**——設了值會靜默跑出未做病灶的結果，不報錯、不警告。
+
+**語意考據**：repo 的 README 寫「sets all synaptic connections **to and from** those
+neurons to zero」，**與程式碼不符**。論文 `model.py` 用 `syn.w['<n> == i'] = 0`，
+而 `syn.connect(i=i_pre, j=i_post)` 確立 Brian2 的 `i` 是突觸前索引，
+所以**只斷傳出**。已依程式碼實作並更正 README。
+
+**驗證**（靜默 21 個糖 GRN）：
+
+| | 活躍神經元 | spikes | 下游 spikes |
+|---|---|---|---|
+| 完整 | 348 | 1,697 | 2,424（2000 步測試） |
+| 靜默 | **21** | 392 | **0** |
+
+- 移除 1,550 條傳出突觸（15,091,983 → 15,090,433）。
+- GRN 自己仍發放（保有 Poisson 驅動），符合「只斷傳出」的語意。
+- 下游活動完全歸零，順帶證明整個糖反應依賴這 21 個神經元的輸出。
+- 不存在的 ID 會拋 `KeyError` 而非被略過。
+
+- **落地**：`FLYBRAIN_SILENCE`（逗號或空白分隔的 FlyWire id），與實驗自身的 `neu_slnc` 合併。
+
 ---
 
 ## 目前最佳設定

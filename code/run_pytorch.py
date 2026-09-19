@@ -110,6 +110,31 @@ PROPAGATION_ENV_VAR = 'FLYBRAIN_PROPAGATION'
 VALID_PROPAGATIONS = ('sparse', 'event')
 
 
+SILENCE_ENV_VAR = 'FLYBRAIN_SILENCE'
+
+
+def resolve_extra_silenced():
+    """Additional FlyWire ids to silence, on top of the experiment's own list.
+
+    Lesioning is how a control is run against this model, and an experiment
+    definition lives in source, so without this the tool can only be used by
+    editing benchmark.py.
+    """
+    raw = os.environ.get(SILENCE_ENV_VAR, '').strip()
+    if not raw:
+        return []
+    ids = []
+    for token in raw.replace(',', ' ').split():
+        try:
+            ids.append(int(token))
+        except ValueError:
+            raise ValueError(
+                f'{SILENCE_ENV_VAR} takes FlyWire root ids separated by commas '
+                f'or spaces; could not read {token!r}'
+            ) from None
+    return ids
+
+
 def resolve_propagation():
     """Select how spikes are pushed through the connectome.
 
@@ -479,6 +504,34 @@ def get_weights(conn_path, comp_path, wt_dir, csr=True):
     else:
         return weight_coo
 
+def silence_neurons(weights, indices):
+    """Drop the outgoing synapses of the given neurons.
+
+    This follows the reference implementation rather than the prose around it.
+    code/paper-phil-drosophila/model.py silences with `syn.w['<n> == i'] = 0`,
+    and Brian2's `i` on a Synapses object is the presynaptic index, so a
+    silenced neuron keeps its own inputs and can still reach threshold -- its
+    spikes simply arrive nowhere. The repository README describes silencing as
+    cutting connections in both directions, which the code it documents does
+    not do.
+
+    The weight matrix is [post, pre], so this drops entries by column.
+    """
+    if not len(indices):
+        return weights
+
+    was_csr = weights.layout == torch.sparse_csr
+    coo = (weights.to_sparse_coo() if was_csr else weights).coalesce()
+    idx, val = coo.indices(), coo.values()
+
+    mask = torch.zeros(coo.shape[0], dtype=torch.bool, device=idx.device)
+    mask[torch.as_tensor(sorted(indices), dtype=torch.long, device=idx.device)] = True
+    keep = ~mask[idx[1]]
+
+    out = torch.sparse_coo_tensor(idx[:, keep], val[keep], coo.shape).coalesce()
+    return out.to_sparse_csr() if was_csr else out
+
+
 def get_nt_weights(nt_mode, conn_path, comp_path, nt_path, device_name, logger):
     """Build weights from the resolved per-neuron transmitter table.
 
@@ -597,6 +650,14 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
         t_mapping_start = time()
         flyid2i, i2flyid = get_hash_tables(str(path_comp))
         exc_indices = [flyid2i[n] for n in experiment['neu_exc']]
+        slnc_ids = list(experiment.get('neu_slnc', [])) + resolve_extra_silenced()
+        missing = [n for n in slnc_ids if n not in flyid2i]
+        if missing:
+            raise KeyError(
+                f'{len(missing)} silenced id(s) are not in this connectome, '
+                f'first is {missing[0]}'
+            )
+        slnc_indices = sorted({flyid2i[n] for n in slnc_ids})
         timings['id_mapping'] = time() - t_mapping_start
         logger.log(f"ID mapping:         {timings['id_mapping']:.3f}s")
 
@@ -620,6 +681,18 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
         timings['weight_loading'] = time() - t_weights_start
         logger.log(f"  Weight loading:   {timings['weight_loading']:.3f}s")
         logger.log(f"  Neurons: {num_neurons}, Batch: {n_run}")
+
+        if slnc_indices:
+            t_slnc = time()
+            if isinstance(weights, list):
+                weights = [silence_neurons(w, slnc_indices) for w in weights]
+                kept = sum(w._nnz() for w in weights)
+            else:
+                weights = silence_neurons(weights, slnc_indices)
+                kept = (weights._nnz() if weights.layout == torch.sparse_coo
+                        else weights.values().numel())
+            logger.log(f"  Silenced:         {len(slnc_indices)} neurons, "
+                       f"{kept} synapses remain ({time() - t_slnc:.3f}s)")
 
         # ===== Phase 3: Create model =====
         logger.log("Creating model...")
