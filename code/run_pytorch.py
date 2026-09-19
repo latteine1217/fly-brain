@@ -24,6 +24,7 @@ from time import perf_counter as time
 import traceback
 
 from model_multi_nt import MultiNTTorchModel, build_channels, load_nt_table
+from propagation import SparsePropagation, build as build_propagation
 from benchmark import (
     T_RUN_VALUES_SEC, N_RUN_VALUES,
     path_comp, path_con, path_wt,
@@ -102,6 +103,28 @@ NT_MODE_ENV_VAR = 'FLYBRAIN_NT_MODE'
 VALID_NT_MODES = ('paper', 'signs', 'channels', 'channels-charge')
 
 
+PROPAGATION_ENV_VAR = 'FLYBRAIN_PROPAGATION'
+
+# sparse : the published formulation, one sparse matrix product per timestep
+# event  : gather only the outgoing synapses of neurons that fired
+VALID_PROPAGATIONS = ('sparse', 'event')
+
+
+def resolve_propagation():
+    """Select how spikes are pushed through the connectome.
+
+    Both give identical output, so this is purely a cost choice; the default
+    keeps the published formulation.
+    """
+    mode = os.environ.get(PROPAGATION_ENV_VAR, '').strip().lower() or 'sparse'
+    if mode not in VALID_PROPAGATIONS:
+        raise ValueError(
+            f'{PROPAGATION_ENV_VAR} must be one of {VALID_PROPAGATIONS}, '
+            f'got {mode!r}'
+        )
+    return mode
+
+
 def resolve_nt_mode():
     """Select the synapse model. Defaults to reproducing the published one."""
     mode = os.environ.get(NT_MODE_ENV_VAR, '').strip().lower() or 'paper'
@@ -122,6 +145,29 @@ def synchronize(device_name):
         torch.cuda.synchronize()
     elif device_name == 'mps':
         torch.mps.synchronize()
+
+
+# Device memory the spike raster may occupy between readbacks: one byte per
+# neuron, per trial, per buffered step.
+SPIKE_WINDOW_BYTES = 64 * 1024 ** 2
+
+
+def spike_window_steps(batch, num_neurons):
+    """How many steps of spike raster to buffer on the device at a time.
+
+    Reading spikes back every step forces a host-device synchronisation every
+    step; buffering a window and reading it back once removes all but one per
+    window. Measured over ten interleaved pairs on MPS the saving is 0.282 ms
+    per step (sd 0.085 ms, all ten pairs in the same direction), which is 2.7%
+    of a 10.3 ms step there. It is a fixed synchronisation cost, so it is a
+    larger fraction of a faster step.
+
+    Timings on this device drift by more than this margin over minutes, so the
+    comparison has to be paired and interleaved; two runs taken minutes apart
+    cannot resolve it.
+    """
+    per_step = max(batch * num_neurons, 1)
+    return max(1, min(1000, SPIKE_WINDOW_BYTES // per_step))
 
 
 def memory_used_gb(device_name):
@@ -312,7 +358,8 @@ class TorchModel(nn.Module):
             params,
             weights,
             exc_indices=None,
-            device='cpu'
+            device='cpu',
+            propagate=None
         ):
         super().__init__()
         self.neurons = AlphaLIF(
@@ -324,6 +371,7 @@ class TorchModel(nn.Module):
             device=device
         )
         self.weights = weights
+        self.propagate = propagate if propagate is not None else SparsePropagation(weights)
         self.poisson = PoissonSpikeGenerator(dt, params['scalePoisson'], device=device)
         self.scale = params['wScale']
 
@@ -338,14 +386,11 @@ class TorchModel(nn.Module):
 
         voltage_stim = self.scale * poisson_spikes
 
-        # weights is [post, pre], so the recurrent drive is W @ spikes^T,
-        # transposed back to [batch, post]. Written as sparse.mm rather than
-        # matmul(dense, sparse.T) because the latter leaves the optimised
-        # sparse kernel: 44x slower on MPS, ~1.5x on CPU at batch 8.
-        weighted_spikes = torch.sparse.mm(
-            self.weights,
-            spikes.t().contiguous()
-        ).t()
+        # See code/propagation.py: the default sparse product is written as
+        # sparse.mm rather than matmul(dense, sparse.T) because the latter
+        # leaves the optimised sparse kernel, and the event strategy skips the
+        # multiply entirely for neurons that did not fire.
+        weighted_spikes = self.propagate(spikes)
 
         recurrent_input = self.scale * weighted_spikes
 
@@ -499,6 +544,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
     """
     device_name = resolve_device()
     nt_mode = resolve_nt_mode()
+    propagation = resolve_propagation()
     nt_taus = None
     t_sim_ms = t_run_sec * 1000.0
     num_steps = int(t_sim_ms / DT)
@@ -512,6 +558,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
     logger.log_raw("=" * 80)
     logger.log(f"Device: {device_name.upper()}")
     logger.log(f"Synapse model: {nt_mode}")
+    logger.log(f"Propagation: {propagation}")
     logger.log(f"Steps: {num_steps} (dt={DT}ms)")
     logger.log(f"Experiment: {exp_name}")
     record_spikes = spike_io_enabled()
@@ -561,6 +608,11 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
         # ===== Phase 3: Create model =====
         logger.log("Creating model...")
         t_model_start = time()
+        if nt_mode.startswith('channels') and propagation == 'event':
+            logger.log(
+                "  NOTE: event propagation is implemented for the single-"
+                "channel model only; using the sparse product."
+            )
         if nt_mode.startswith('channels'):
             model = MultiNTTorchModel(
                 n_run,
@@ -581,7 +633,8 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
                 MODEL_PARAMS,
                 weights,
                 exc_indices=exc_indices,
-                device=device_name
+                device=device_name,
+                propagate=build_propagation(propagation, weights, device_name)
             )
         conductance, delay_buffer, spikes, v, refrac = model.state_init()
         timings['model_creation'] = time() - t_model_start
@@ -600,9 +653,15 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
         # ===== Phase 5: Run simulation =====
         logger.log(f"Running simulation ({num_steps} steps, {n_run} trial(s) batched)...")
 
-        spike_batch_idx = []
-        spike_neuron_idx = []
-        spike_timesteps = []
+        # Each entry is an (nnz, 3) tensor of (step, trial, neuron).
+        spike_events = []
+        window = spike_window_steps(n_run, num_neurons) if record_spikes else 0
+        if record_spikes:
+            spike_window = torch.zeros(
+                window, n_run, num_neurons,
+                dtype=torch.bool, device=device_name,
+            )
+            logger.log(f"  Spike buffer:     {window} steps on device")
 
         t_simulation_start = time()
         with torch.no_grad():
@@ -611,14 +670,12 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
                     rates, conductance, delay_buffer, spikes, v, refrac
                 )
                 if record_spikes:
-                    spike_mask = spikes > 0
-                    if spike_mask.any():
-                        b_idx, n_idx = spike_mask.nonzero(as_tuple=True)
-                        spike_batch_idx.append(b_idx.cpu())
-                        spike_neuron_idx.append(n_idx.cpu())
-                        spike_timesteps.append(
-                            torch.full((len(b_idx),), t_step, dtype=torch.long)
-                        )
+                    slot = t_step % window
+                    spike_window[slot] = spikes > 0
+                    if slot == window - 1:
+                        events = spike_window.nonzero()
+                        events[:, 0] += t_step - slot
+                        spike_events.append(events.cpu())
 
                 if num_steps >= 10000 and (t_step + 1) % (num_steps // 10) == 0:
                     elapsed = time() - t_simulation_start
@@ -627,6 +684,12 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
                         f"  Progress: {pct:.0f}% ({t_step+1}/{num_steps})"
                         f" - {elapsed:.1f}s elapsed"
                     )
+
+            if record_spikes and num_steps % window:
+                tail = num_steps % window
+                events = spike_window[:tail].nonzero()
+                events[:, 0] += num_steps - tail
+                spike_events.append(events.cpu())
 
         synchronize(device_name)
 
@@ -655,10 +718,11 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
             timings['result_collection'] = 0.0
             timings['result_save'] = 0.0
             logger.log("  Spike probing/output disabled; no parquet written")
-        elif spike_batch_idx:
-            all_batch = torch.cat(spike_batch_idx).numpy()
-            all_neurons = torch.cat(spike_neuron_idx).numpy()
-            all_times_steps = torch.cat(spike_timesteps).numpy()
+        elif any(e.numel() for e in spike_events):
+            events = torch.cat(spike_events)
+            all_times_steps = events[:, 0].numpy()
+            all_batch = events[:, 1].numpy()
+            all_neurons = events[:, 2].numpy()
             all_times_ms = all_times_steps * DT
 
             df = pd.DataFrame({

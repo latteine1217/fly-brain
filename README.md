@@ -208,6 +208,51 @@ A `channels` run is not comparable with the Brian2 ground truth and is labelled
 `PyTorch (MPS) [nt:channels]` in the results CSV so it cannot be mistaken for
 one.
 
+### Spike propagation
+
+The published formulation multiplies the whole connectome every timestep,
+which costs the same whether the brain is silent or saturated: 4.38 ms on MPS
+with no neuron firing, 4.19 ms with 5000 firing. Under the stimulus protocols
+here about 1.7 neurons fire per step, so nearly all of that multiplies zeros.
+
+`FLYBRAIN_PROPAGATION=event` gathers only the outgoing synapses of neurons
+that fired instead. Output is bit-identical -- 166M spike entries compared on
+both CPU and MPS with zero mismatches -- so the choice is purely one of cost.
+
+End-to-end ms/step, 300 steps, spike recording off, median of 3 paired repeats:
+
+| device | batch | `sparse` | `event` | speedup |
+| --- | --- | --- | --- | --- |
+| MPS | 1 | 9.36 | **2.13** | 4.4x |
+| MPS | 8 | 34.49 | 17.75 | 1.9x |
+| MPS | 32 | 112.13 | 60.38 | 1.9x |
+| CPU | 1 | 84.73 | **1.81** | 46.7x |
+| CPU | 8 | 106.05 | 16.20 | 6.5x |
+| CPU | 32 | 213.49 | 76.55 | 2.8x |
+
+Two consequences worth knowing before choosing a configuration.
+
+**CPU beats MPS at small batch once propagation is event-driven.** The device
+split the step between them: MPS runs the dense state update 5.8x faster
+(0.26 ms against 1.52 ms) while CPU runs the event gather 6.4x faster (0.29 ms
+against 1.87 ms), because MPS spends most of an event step in kernel launch
+and one synchronisation regardless of how few spikes there are. Those cancel,
+and CPU comes out ahead until batch 32.
+
+**Batching stops paying.** With `sparse`, per-trial cost falls from 9.36 to
+3.50 ms between batch 1 and 32 on MPS. With `event` it is flat, 1.8-2.4 ms at
+every batch and every device, because event work scales with the batch and
+there is no fixed cost left to amortise. Multi-trial experiments are better
+run as separate batch-1 processes than as one wide batch.
+
+Event propagation is implemented for the single-channel model. The per-channel
+models (`channels`, `channels-charge`) keep the sparse product and say so.
+
+Spike recording is buffered on the device and read back once per window rather
+than every step, which removes a per-step synchronisation worth 0.282 ms
+(sd 0.085, ten interleaved pairs). Timings on this machine drift by more than
+that between runs, so comparisons have to be paired.
+
 ### Calibrating w_syn
 
 `w_syn` is the model's only free parameter; every other constant is cited to a
