@@ -261,6 +261,14 @@ at 160 spikes per step down to 0.16x at 27,721. Unlike CPU and MPS, batching
 does pay here: per-trial cost falls 4.3x between batch 1 and 32, making CUDA at
 batch 32 the cheapest per-trial configuration measured anywhere.
 
+Raise both at once and `event` does not merely lose, it collapses: at batch 32
+with every neuron driven to 1000 Hz it takes 2155 ms per step against 19 ms for
+the sparse product, 112x worse, and peaks at 5.02 of 6 GB of VRAM. There are
+then 13,890 spikes per trial across 32 trials, so the gather touches about 48M
+synapses per step, three times the 15.1M in the whole connectome. On CUDA,
+`sparse` is the right default and `event` is for sparse protocols only -- the
+opposite of the rule on Apple Silicon.
+
 The rule across devices is that the faster a device runs the sparse product,
 the narrower the activity range in which `event` is worth using: CPU wins
 everywhere tested, MPS below roughly 100 Hz mean firing, CUDA only in sparse
