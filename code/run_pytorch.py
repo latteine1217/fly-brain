@@ -173,10 +173,84 @@ COMPILE_ENV_VAR = 'FLYBRAIN_COMPILE'
 
 DATASET_ENV_VAR = 'FLYBRAIN_DATASET'
 
-# brain : FlyWire v783, 138,639 neurons, the published model
-# cns   : that brain sewn to the MANC ventral nerve cord, 161,291 neurons,
-#         so descending commands reach motor neurons (see code/build_cns.py)
-VALID_DATASETS = ('brain', 'cns')
+# brain   : FlyWire v783, 138,639 neurons, the published model
+# cns     : that brain sewn to the MANC ventral nerve cord, 161,291 neurons,
+#           so descending commands reach motor neurons (code/build_cns.py).
+#           A female brain on a male cord, and only 39% of descending neurons
+#           could be matched across the two datasets.
+# malecns : one male fly's whole central nervous system, 165,122 neurons,
+#           imaged as a single volume (code/build_malecns.py). Nothing is
+#           sewn, nothing is a chimera, and the transmitter predictions that
+#           ship with it already name histamine.
+VALID_DATASETS = ('brain', 'cns', 'malecns')
+
+
+W_SYN_ENV_VAR = 'FLYBRAIN_W_SYN'
+
+
+def resolve_w_syn():
+    """Synaptic weight scale, the model's one free parameter.
+
+    It is not a property of the equations but a fit, and it was fitted to
+    FlyWire. MaleCNS carries 124M synapses against FlyWire's 54.5M, and the
+    published 0.275 drives it into the self-sustaining state the settling check
+    reports; around 0.10 is the most it tolerates. Overriding it here means a
+    dataset can be used before it has a calibration of its own.
+    """
+    raw = os.environ.get(W_SYN_ENV_VAR, '').strip()
+    if not raw:
+        return MODEL_PARAMS['wScale']
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f'{W_SYN_ENV_VAR} must be a number, got {raw!r}') from None
+    if not value > 0:
+        raise ValueError(f'{W_SYN_ENV_VAR} must be positive, got {value}')
+    return value
+
+
+def resolve_stimulus(dataset, flywire_ids, flyid2i, data_dir, logger, label):
+    """Map an experiment's neurons onto whichever connectome is loaded.
+
+    Experiments name FlyWire root ids. The cns dataset keeps the brain's ids,
+    so they carry over unchanged. MaleCNS is a different animal, so they are
+    carried across by cell type instead -- and the resolved count is logged,
+    because it is not guaranteed to match. The sugar experiment names 21
+    right-hemisphere LB3 neurons; this volume holds 87 of them, which is a
+    different stimulus wearing the same name.
+    """
+    if not flywire_ids:
+        return []
+    if dataset != 'malecns':
+        return sorted({flyid2i[n] for n in flywire_ids})
+
+    ann_path = data_dir / 'flywire_annotations_783.tsv'
+    type_path = data_dir / 'malecns_types.csv'
+    for p in (ann_path, type_path):
+        if not p.exists():
+            raise FileNotFoundError(
+                f'{p} is needed to carry a FlyWire-defined experiment onto '
+                f'MaleCNS by cell type. Run code/prepare_neurotransmitters.py '
+                f'for the annotations and code/build_malecns.py for the rest.'
+            )
+
+    ann = pd.read_csv(ann_path, sep='\t', low_memory=False,
+                      usecols=['root_id', 'cell_type'])
+    ann['root_id'] = ann['root_id'].astype('int64')
+    wanted = set(ann[ann.root_id.isin(flywire_ids)].cell_type.dropna())
+    if not wanted:
+        raise ValueError(f'{label}: none of its neurons carry a cell type, so '
+                         f'it cannot be carried onto MaleCNS')
+
+    types = pd.read_csv(type_path)
+    hit = types[types.flywireType.isin(wanted)]
+    if hit.empty:
+        raise ValueError(f'{label}: no MaleCNS neuron carries any of the '
+                         f'FlyWire types {sorted(wanted)}')
+    idx = sorted(flyid2i[b] for b in hit.bodyId if b in flyid2i)
+    logger.log(f"  {label}: {len(flywire_ids)} FlyWire neurons of type "
+               f"{sorted(wanted)} -> {len(idx)} here")
+    return idx
 
 
 def resolve_dataset():
@@ -199,13 +273,15 @@ def dataset_paths(name):
     if name == 'brain':
         return Path(path_con), Path(path_comp), Path(path_wt)
     data = Path(path_wt)
-    cache = data / 'cns_weights'
+    builder = {'cns': 'build_cns.py', 'malecns': 'build_malecns.py'}[name]
+    cache = data / f'{name}_weights'
     cache.mkdir(parents=True, exist_ok=True)
-    conn, comp = data / 'cns_connectivity.parquet', data / 'cns_completeness.csv'
+    conn = data / f'{name}_connectivity.parquet'
+    comp = data / f'{name}_completeness.csv'
     for p in (conn, comp):
         if not p.exists():
             raise FileNotFoundError(
-                f'{p} not found; build it with python code/build_cns.py'
+                f'{p} not found; build it with python code/{builder}'
             )
     return conn, comp, cache
 
@@ -672,6 +748,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
     compile_model = resolve_compile()
     settle_check = resolve_settle_check()
     dataset = resolve_dataset()
+    params = dict(MODEL_PARAMS, wScale=resolve_w_syn())
     ds_con, ds_comp, ds_wt = dataset_paths(dataset)
     nt_taus = None
     t_sim_ms = t_run_sec * 1000.0
@@ -686,6 +763,8 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
     logger.log_raw("=" * 80)
     logger.log(f"Device: {device_name.upper()}")
     logger.log(f"Dataset: {dataset}")
+    if params['wScale'] != MODEL_PARAMS['wScale']:
+        logger.log(f"w_syn: {params['wScale']} (published {MODEL_PARAMS['wScale']})")
     logger.log(f"Synapse model: {nt_mode}")
     logger.log(f"Propagation: {propagation}")
     logger.log(f"torch.compile: {'on' if compile_model else 'off'}")
@@ -711,15 +790,21 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
         # ===== Phase 1: ID mappings =====
         t_mapping_start = time()
         flyid2i, i2flyid = get_hash_tables(str(ds_comp))
-        exc_indices = [flyid2i[n] for n in experiment['neu_exc']]
+        exc_indices = resolve_stimulus(
+            dataset, list(experiment['neu_exc']), flyid2i,
+            Path(path_wt), logger, 'stimulus')
         slnc_ids = list(experiment.get('neu_slnc', [])) + resolve_extra_silenced()
-        missing = [n for n in slnc_ids if n not in flyid2i]
-        if missing:
-            raise KeyError(
-                f'{len(missing)} silenced id(s) are not in this connectome, '
-                f'first is {missing[0]}'
-            )
-        slnc_indices = sorted({flyid2i[n] for n in slnc_ids})
+        # Only meaningful where the ids are this dataset's own; on MaleCNS the
+        # resolver carries them across by type and raises for itself.
+        if dataset != 'malecns':
+            missing = [n for n in slnc_ids if n not in flyid2i]
+            if missing:
+                raise KeyError(
+                    f'{len(missing)} silenced id(s) are not in this connectome, '
+                    f'first is {missing[0]}'
+                )
+        slnc_indices = resolve_stimulus(
+            dataset, slnc_ids, flyid2i, Path(path_wt), logger, 'silenced')
         timings['id_mapping'] = time() - t_mapping_start
         logger.log(f"ID mapping:         {timings['id_mapping']:.3f}s")
 
@@ -769,7 +854,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
                 n_run,
                 num_neurons,
                 DT,
-                MODEL_PARAMS,
+                params,
                 nt_taus,
                 weights,
                 LIFNeuron(n_run, num_neurons, DT, MODEL_PARAMS, device=device_name),
@@ -781,7 +866,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
                 n_run,
                 num_neurons,
                 DT,
-                MODEL_PARAMS,
+                params,
                 weights,
                 exc_indices=exc_indices,
                 device=device_name,

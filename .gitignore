@@ -30,3 +30,10 @@ data/vnc/
 data/cns_completeness.csv
 data/cns_connectivity.parquet
 data/cns_weights/
+
+# MaleCNS downloads and the dataset built from them
+data/malecns/
+data/malecns_completeness.csv
+data/malecns_connectivity.parquet
+data/malecns_types.csv
+data/malecns_weights/

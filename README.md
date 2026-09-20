@@ -202,6 +202,54 @@ Ids not present in the connectome raise rather than being skipped. Silencing all
 active neurons to 21 — the GRNs keep firing on their Poisson drive, and nothing
 downstream of them does.
 
+### MaleCNS: one animal, whole nervous system
+
+Joining FlyWire to MANC produces a chimera, and only 39% of the descending
+neurons could be matched. MaleCNS avoids both: one male fly's entire central
+nervous system, brain and nerve cord imaged as a single volume, so descending
+neurons arrive with both halves already attached and nothing has to be sewn.
+
+```bash
+B=https://storage.googleapis.com/flyem-male-cns/v1.0/connectome-data/flat-connectome
+mkdir -p data/malecns && cd data/malecns
+curl -O $B/body-annotations-male-cns-v1.0-minconf-0.5.feather
+curl -O $B/body-neurotransmitters-male-cns-v1.0.feather
+curl -O $B/connectome-weights-male-cns-v1.0-minconf-0.5-traced-only.feather
+cd ../.. && .venv/bin/python code/build_malecns.py
+
+FLYBRAIN_DATASET=malecns FLYBRAIN_W_SYN=0.10 \
+  .venv/bin/python main.py --pytorch --t_run 0.1 --n_run 1
+```
+
+| | brain | cns | malecns |
+| --- | --- | --- | --- |
+| neurons | 138,639 | 161,291 | 165,122 |
+| connections | 15.1 M | 20.3 M | 25.6 M |
+| synapses | 54.5 M | 85.2 M | **124.0 M** |
+| motor neurons | 110 | 434 | 815 |
+| one animal | brain only | no | **yes** |
+
+It also ships its own transmitter predictions, 83,496 of them backed by a
+literature ground truth, and they name histamine. The correction that
+`prepare_neurotransmitters.py` recovers for FlyWire -- 7,362 photoreceptors
+scored excitatory because the six-class classifier cannot emit histamine --
+simply does not arise here: 5,910 neurons come labelled histaminergic and
+inhibitory.
+
+**It needs its own w_syn.** That parameter is a fit, not a property of the
+equations, and it was fitted to FlyWire. At the published 0.275 the sugar
+protocol drives MaleCNS into the self-sustaining state, 14,501 neurons firing
+and still firing 100 ms after the stimulus stops. Around 0.10 it settles: 248
+neurons, quiet again within 25 ms, which is the scale of FlyWire's own
+response. `FLYBRAIN_W_SYN` sets it. Settling is a bound, not a calibration --
+fitting it properly needs an observable, and `code/calibrate_w_syn.py` reads
+out MN9, which is a FlyWire cell.
+
+Experiments are defined by FlyWire root id, so on this dataset they are carried
+across by cell type and the runner reports what that resolved to. It is not
+always the same stimulus: the sugar experiment names 21 right-hemisphere LB3
+neurons and this volume holds 87 of them.
+
 ### The ventral nerve cord
 
 FlyWire is a brain. It stops at the neck, so a descending neuron in it is half
