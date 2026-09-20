@@ -150,6 +150,40 @@ With the Poisson input held fixed, spike trains and membrane voltages are
 bit-identical across CPU/CSR, CPU/COO and MPS/COO, and unchanged from the
 `matmul(spikes, W.T)` formulation this replaced.
 
+### Settling check
+
+This model has two regimes and only one of them is a response. Drive a small
+set of neurons and activity rises, spreads and stops: the published sugar
+protocol reaches 365 neurons and is silent again 50 ms after the stimulus ends.
+Drive a larger set -- around 200 receptor neurons at 20 Hz, or 200 random
+neurons at 100 Hz -- and the network latches into a self-sustaining state that
+never returns to rest. It still produces spikes, a great many of them, but they
+carry no stimulus identity: two different odours in that state recruit the same
+cells, Jaccard 0.99.
+
+Nothing distinguished the two from the outside. A latched run completes,
+reports `success`, and writes a plausible-looking raster. So every run now ends
+with a short quiet period and reports whether the network returned to rest.
+The model has no basal firing, so the criterion needs no threshold: with the
+stimulus removed, any activity at all is self-sustaining.
+
+```
+Settling (4x25ms quiet):  190 65 0 0
+Network returned to rest.
+```
+
+```
+Settling (4x25ms quiet):  11556 11649 11197 11833
+WARNING: 11833 spikes still firing 100 ms after the stimulus ended. The
+network is self-sustaining, so this run's spikes do not represent a response
+to the stimulus.
+```
+
+The check runs outside the timed section, so `sim_time` and the other
+benchmark figures are unchanged; only wall-clock grows, by the length of the
+quiet period. `FLYBRAIN_SETTLE_CHECK=0` turns it off. Both shipped
+experiments settle: sugar GRNs at 200 Hz and P9 at 100 Hz.
+
 ### Lesions and controls
 
 Silencing is how a control is run against this model, and until now the PyTorch

@@ -135,6 +135,24 @@ def resolve_extra_silenced():
     return ids
 
 
+SETTLE_CHECK_ENV_VAR = 'FLYBRAIN_SETTLE_CHECK'
+
+# The quiet period run after the stimulus, and how it is reported.
+SETTLE_WINDOWS = 4
+SETTLE_WINDOW_MS = 25.0
+
+
+def resolve_settle_check():
+    """Whether to test that the network returns to rest after the stimulus.
+
+    On by default. The check runs outside the timed section, so benchmark
+    numbers are unaffected and only wall-clock grows.
+    """
+    return os.environ.get(SETTLE_CHECK_ENV_VAR, '').strip().lower() not in (
+        '0', 'false', 'no', 'off'
+    )
+
+
 def resolve_propagation():
     """Select how spikes are pushed through the connectome.
 
@@ -613,6 +631,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
     nt_mode = resolve_nt_mode()
     propagation = resolve_propagation()
     compile_model = resolve_compile()
+    settle_check = resolve_settle_check()
     nt_taus = None
     t_sim_ms = t_run_sec * 1000.0
     num_steps = int(t_sim_ms / DT)
@@ -628,6 +647,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
     logger.log(f"Synapse model: {nt_mode}")
     logger.log(f"Propagation: {propagation}")
     logger.log(f"torch.compile: {'on' if compile_model else 'off'}")
+    logger.log(f"Settling check: {'on' if settle_check else 'off'}")
     logger.log(f"Steps: {num_steps} (dt={DT}ms)")
     logger.log(f"Experiment: {exp_name}")
     record_spikes = spike_io_enabled()
@@ -807,6 +827,43 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
         mem_gb = memory_used_gb(device_name)
         if mem_gb is not None:
             logger.log(f"  Device mem used:  {mem_gb:.2f} GB")
+
+        # ===== Ignition check =====
+        # This model has no basal firing, so with the stimulus removed any
+        # activity that persists is self-sustaining rather than a response.
+        # Large stimuli can latch the network into that state, where it
+        # produces plenty of spikes that carry no stimulus identity -- a run
+        # that looks successful and is not. Deliberately outside the timed
+        # section: it must not change what the benchmark reports.
+        if settle_check:
+            quiet = torch.zeros_like(rates)
+            windows = []
+            with torch.no_grad():
+                for _ in range(SETTLE_WINDOWS):
+                    n = torch.zeros((), device=device_name)
+                    for _ in range(int(SETTLE_WINDOW_MS / DT)):
+                        conductance, delay_buffer, spikes, v, refrac = model(
+                            quiet, conductance, delay_buffer, spikes, v, refrac
+                        )
+                        n += spikes.sum()
+                    windows.append(int(n.item()))
+            synchronize(device_name)
+
+            settled = windows[-1] == 0
+            results['settled'] = settled
+            results['settle_windows'] = windows
+            trace = " ".join(str(w) for w in windows)
+            logger.log(f"  Settling ({SETTLE_WINDOWS}x{SETTLE_WINDOW_MS:.0f}ms "
+                       f"quiet):  {trace}")
+            if settled:
+                logger.log("  Network returned to rest.")
+            else:
+                logger.log(
+                    f"  WARNING: {windows[-1]} spikes still firing "
+                    f"{SETTLE_WINDOWS * SETTLE_WINDOW_MS:.0f} ms after the "
+                    f"stimulus ended. The network is self-sustaining, so this "
+                    f"run's spikes do not represent a response to the stimulus."
+                )
 
         # ===== Phase 6: Collect and save results =====
         logger.log("Collecting results...")
