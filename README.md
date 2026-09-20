@@ -202,6 +202,47 @@ Ids not present in the connectome raise rather than being skipped. Silencing all
 active neurons to 21 — the GRNs keep firing on their Poisson drive, and nothing
 downstream of them does.
 
+### The ventral nerve cord
+
+FlyWire is a brain. It stops at the neck, so a descending neuron in it is half
+a cell: the model can excite one and watch it fire, and the spikes go nowhere,
+because the motor circuits they command are in the ventral nerve cord and the
+nerve cord is not in the dataset.
+
+`code/build_cns.py` sews the two halves back together, using the MANC nerve
+cord connectome (CC-BY, Janelia) and the descending neuron correspondence from
+the neck connective work of Stürner et al., whose supplemental tables carry a
+FlyWire root id and a MANC body id under one harmonised type vocabulary.
+Matching on (type, side) joins 394 groups: 513 brain descending neurons, 39.1%
+of them, are reunited with their axons.
+
+```bash
+.venv/bin/python code/build_cns.py                       # builds it once
+FLYBRAIN_DATASET=cns .venv/bin/python main.py --pytorch --t_run 0.1 --n_run 1
+```
+
+| | brain | cns |
+| --- | --- | --- |
+| neurons | 138,639 | 161,291 |
+| connections | 15.1 M | 20.3 M |
+| synapses | 54.5 M | 85.2 M |
+| motor neurons | 110 | 434 |
+
+Descending commands now arrive somewhere. Driving DNa02, a steering neuron,
+recruits 611 nerve cord neurons and fires 33 motor neurons; MDN, which drives
+backward walking, fires 27. Both settle afterwards. The sugar protocol gains
+about 190 nerve cord neurons over the brain alone.
+
+Three things to keep in mind. FlyWire is a female brain and MANC a male nerve
+cord, so this animal is a chimera. The 61% of descending neurons that could not
+be matched keep both halves and no join between them, so any command routed
+through those cells still stops at the neck. And 55 of the 536 sewn pairs
+disagree between the two datasets about their own transmitter; the brain's
+assignment is kept and the count is printed, not hidden.
+
+The per-transmitter synapse models (`FLYBRAIN_NT_MODE`) cover the brain only
+and refuse to run on this dataset rather than silently mis-signing the cord.
+
 ### Neurotransmitter identity and synaptic kinetics
 
 The shipped connectivity parquet stores transmitter identity as a single

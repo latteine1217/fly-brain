@@ -22,3 +22,11 @@ data/weight_csr.pkl
 # table derived from them by code/prepare_neurotransmitters.py
 data/flywire_annotations_783.tsv
 data/neurotransmitters_783.csv
+
+# Ventral nerve cord: MANC downloads, the published matching tables,
+# and the combined connectome built from them by code/build_cns.py
+data/manc/
+data/vnc/
+data/cns_completeness.csv
+data/cns_connectivity.parquet
+data/cns_weights/

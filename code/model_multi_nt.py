@@ -99,8 +99,12 @@ def load_nt_table(nt_path, num_neurons):
     if len(nt) != num_neurons:
         raise ValueError(
             f'neurotransmitter table has {len(nt)} rows but the model has '
-            f'{num_neurons} neurons; regenerate it with '
-            f'code/prepare_neurotransmitters.py'
+            f'{num_neurons} neurons. The table is built from the FlyWire brain '
+            f'annotations and covers the brain only, so the per-transmitter '
+            f'synapse models do not yet run on the combined brain and nerve '
+            f'cord dataset. Use FLYBRAIN_DATASET=brain, or rebuild the table '
+            f'with code/prepare_neurotransmitters.py if the brain itself '
+            f'changed.'
         )
     nt = nt.sort_values('neuron_index')
     unknown = set(nt['nt_class']) - set(NT_KINETICS)

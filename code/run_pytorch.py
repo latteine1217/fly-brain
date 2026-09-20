@@ -171,6 +171,45 @@ def resolve_propagation():
 COMPILE_ENV_VAR = 'FLYBRAIN_COMPILE'
 
 
+DATASET_ENV_VAR = 'FLYBRAIN_DATASET'
+
+# brain : FlyWire v783, 138,639 neurons, the published model
+# cns   : that brain sewn to the MANC ventral nerve cord, 161,291 neurons,
+#         so descending commands reach motor neurons (see code/build_cns.py)
+VALID_DATASETS = ('brain', 'cns')
+
+
+def resolve_dataset():
+    """Which connectome to simulate."""
+    name = os.environ.get(DATASET_ENV_VAR, '').strip().lower() or 'brain'
+    if name not in VALID_DATASETS:
+        raise ValueError(
+            f'{DATASET_ENV_VAR} must be one of {VALID_DATASETS}, got {name!r}'
+        )
+    return name
+
+
+def dataset_paths(name):
+    """Connectivity, completeness and weight-cache locations for a dataset.
+
+    Each dataset caches its prepared weight matrices in its own directory:
+    they share a filename, and one silently standing in for the other would be
+    hard to notice and produce a wrong answer rather than an error.
+    """
+    if name == 'brain':
+        return Path(path_con), Path(path_comp), Path(path_wt)
+    data = Path(path_wt)
+    cache = data / 'cns_weights'
+    cache.mkdir(parents=True, exist_ok=True)
+    conn, comp = data / 'cns_connectivity.parquet', data / 'cns_completeness.csv'
+    for p in (conn, comp):
+        if not p.exists():
+            raise FileNotFoundError(
+                f'{p} not found; build it with python code/build_cns.py'
+            )
+    return conn, comp, cache
+
+
 def resolve_compile():
     """Whether to put the model through torch.compile.
 
@@ -632,6 +671,8 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
     propagation = resolve_propagation()
     compile_model = resolve_compile()
     settle_check = resolve_settle_check()
+    dataset = resolve_dataset()
+    ds_con, ds_comp, ds_wt = dataset_paths(dataset)
     nt_taus = None
     t_sim_ms = t_run_sec * 1000.0
     num_steps = int(t_sim_ms / DT)
@@ -644,6 +685,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
     logger.log(f"{run_info}BENCHMARK: t_run={t_run_sec}s, n_run={n_run}")
     logger.log_raw("=" * 80)
     logger.log(f"Device: {device_name.upper()}")
+    logger.log(f"Dataset: {dataset}")
     logger.log(f"Synapse model: {nt_mode}")
     logger.log(f"Propagation: {propagation}")
     logger.log(f"torch.compile: {'on' if compile_model else 'off'}")
@@ -668,7 +710,7 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
     try:
         # ===== Phase 1: ID mappings =====
         t_mapping_start = time()
-        flyid2i, i2flyid = get_hash_tables(str(path_comp))
+        flyid2i, i2flyid = get_hash_tables(str(ds_comp))
         exc_indices = [flyid2i[n] for n in experiment['neu_exc']]
         slnc_ids = list(experiment.get('neu_slnc', [])) + resolve_extra_silenced()
         missing = [n for n in slnc_ids if n not in flyid2i]
@@ -687,14 +729,14 @@ def run_single_benchmark(t_run_sec, n_run, experiment, logger,
         if nt_mode == 'paper':
             # MPS implements no sparse CSR ops at all, so it takes COO.
             weights = get_weights(
-                str(path_con), str(path_comp), str(path_wt),
+                str(ds_con), str(ds_comp), str(ds_wt),
                 csr=(device_name != 'mps'),
             )
             weights = weights.to(device=device_name)
             num_neurons = weights.shape[0]
         else:
             nt_taus, weights, num_neurons = get_nt_weights(
-                nt_mode, str(path_con), str(path_comp),
+                nt_mode, str(ds_con), str(ds_comp),
                 Path(path_wt) / 'neurotransmitters_783.csv',
                 device_name, logger,
             )
